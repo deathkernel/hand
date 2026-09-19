@@ -5,16 +5,23 @@ import time
 import urllib.request
 from collections import deque
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List
 
 import cv2
 import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
-MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
-MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
-MODEL_PATH = os.path.join(MODEL_DIR, "hand_landmarker.task")
+from face_hud import (
+    blendshape_map,
+    draw_face_hud,
+    ensure_model as ensure_face_model,
+)
+
+HAND_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
+HAND_MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+HAND_MODEL_PATH = os.path.join(HAND_MODEL_DIR, "hand_landmarker.task")
+FACE_MODEL_PATH = os.path.join(HAND_MODEL_DIR, "face_landmarker.task")
 
 CYAN = (255, 215, 40)
 BLUE = (255, 130, 20)
@@ -64,15 +71,11 @@ class Hologram:
         self.rotation += 0.018
         self.pulse *= 0.93
         self.explosion *= 0.94
-        self.energy += 0.08
-        self.energy = min(100, self.energy)
-
+        self.energy = min(100, self.energy + 0.08)
         for p in self.particles:
-            # Floating 3D-space illusion.
             p.vx += math.sin(p.y * 0.012 + p.z * 2.0) * 0.012
             p.vy += math.cos(p.x * 0.010 - p.z) * 0.012
             p.vz += math.sin(p.x * 0.008 + p.y * 0.006) * 0.008
-
             for x, y, gesture, strength in hands:
                 dx, dy = x - p.x, y - p.y
                 d2 = dx * dx + dy * dy + 500
@@ -87,7 +90,6 @@ class Hologram:
                 elif gesture == "FIST":
                     p.vx += (self.w / 2 - p.x) * 0.0008
                     p.vy += (self.h / 2 - p.y) * 0.0008
-
             p.x += p.vx
             p.y += p.vy
             p.z += p.vz
@@ -96,7 +98,6 @@ class Hologram:
             p.vz *= 0.985
             p.life -= 1
             p.size *= 0.998
-
         self.particles = [p for p in self.particles if p.life > 0 and -100 < p.x < self.w + 100 and -100 < p.y < self.h + 100]
 
     def draw(self, frame):
@@ -111,12 +112,12 @@ class Hologram:
         cv2.addWeighted(glow, 0.08, frame, 0.92, 0, frame)
 
 
-def ensure_model():
-    if os.path.isfile(MODEL_PATH):
+def ensure_hand_model():
+    if os.path.isfile(HAND_MODEL_PATH) and os.path.getsize(HAND_MODEL_PATH) > 100_000:
         return
-    os.makedirs(MODEL_DIR, exist_ok=True)
-    print("Downloading MediaPipe hand model...")
-    urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+    os.makedirs(HAND_MODEL_DIR, exist_ok=True)
+    print("Downloading MediaPipe hand model (first run only)...")
+    urllib.request.urlretrieve(HAND_MODEL_URL, HAND_MODEL_PATH)
 
 
 def dist(a, b):
@@ -163,8 +164,9 @@ def xy(l, shape):
     return int(l[8].x * w), int(l[8].y * h)
 
 
-
 def square_metrics(points):
+    # deque supports iteration but not slicing; normalize it once.
+    points = list(points)
     if len(points) < 20:
         return None
     xs = [p[0] for p in points]
@@ -186,7 +188,10 @@ def square_metrics(points):
     score -= min(1.0, (closure / scale) / 0.25) * 0.40
     score -= min(1.0, abs(path_ratio - 1.0) / 0.8) * 0.25
     return {
-        "min_x": min_x, "max_x": max_x, "min_y": min_y, "max_y": max_y,
+        "min_x": min_x,
+        "max_x": max_x,
+        "min_y": min_y,
+        "max_y": max_y,
         "score": score,
         "valid": closure / scale < 0.25 and aspect_error < 0.35 and 0.7 < path_ratio < 2.2 and score >= 0.58,
     }
@@ -219,12 +224,13 @@ def draw_hand(frame, l, gesture):
 
 
 def ring(layer, center, radius, color=CYAN, thickness=1, segments=64, phase=0):
+    import numpy as np
     cx, cy = center
     pts = []
     for i in range(segments + 1):
         a = phase + math.tau * i / segments
         pts.append((int(cx + math.cos(a) * radius), int(cy + math.sin(a) * radius)))
-    cv2.polylines(layer, [__import__('numpy').array(pts, dtype='int32')], False, color, thickness, cv2.LINE_AA)
+    cv2.polylines(layer, [np.array(pts, dtype="int32")], False, color, thickness, cv2.LINE_AA)
 
 
 def arc_reactor(frame, center, radius, phase, energy):
@@ -244,47 +250,64 @@ def arc_reactor(frame, center, radius, phase, energy):
     cv2.putText(frame, f"ARC ENERGY {energy:03.0f}%", (cx - 70, cy + int(radius * 1.55)), cv2.FONT_HERSHEY_SIMPLEX, .43, CYAN, 1, cv2.LINE_AA)
 
 
-def hud(frame, gesture, hands, fps, energy, locked):
+def hud(frame, gesture, hands, fps, energy, locked, face_detected, face_expression):
     h, w = frame.shape[:2]
     overlay = frame.copy()
-    cv2.rectangle(overlay, (18, 18), (390, 148), DARK, -1)
+    cv2.rectangle(overlay, (18, 18), (430, 170), DARK, -1)
     cv2.addWeighted(overlay, .72, frame, .28, 0, frame)
     cv2.putText(frame, "J.A.R.V.I.S.", (34, 48), cv2.FONT_HERSHEY_SIMPLEX, .85, WHITE, 2, cv2.LINE_AA)
-    cv2.putText(frame, "HAND INTERFACE // ONLINE", (34, 70), cv2.FONT_HERSHEY_SIMPLEX, .40, CYAN, 1, cv2.LINE_AA)
+    cv2.putText(frame, "HAND + FACIAL INTERFACE // ONLINE", (34, 70), cv2.FONT_HERSHEY_SIMPLEX, .38, CYAN, 1, cv2.LINE_AA)
     cv2.putText(frame, f"GESTURE   {gesture:<8}   HANDS {hands}", (34, 94), cv2.FONT_HERSHEY_SIMPLEX, .42, WHITE, 1, cv2.LINE_AA)
     cv2.putText(frame, f"ENERGY    {energy:05.1f}%   FPS {fps:04.0f}", (34, 116), cv2.FONT_HERSHEY_SIMPLEX, .42, WHITE, 1, cv2.LINE_AA)
     cv2.putText(frame, f"TARGET    {'LOCKED' if locked else 'SEARCHING'}", (34, 138), cv2.FONT_HERSHEY_SIMPLEX, .42, ORANGE if locked else CYAN, 1, cv2.LINE_AA)
-
-    # Minimal bottom command strip.
+    face_status = "DETECTED" if face_detected else "SEARCHING"
+    cv2.putText(frame, f"FACE      {face_status:<9} {face_expression}", (34, 160), cv2.FONT_HERSHEY_SIMPLEX, .40, CYAN if face_detected else ORANGE, 1, cv2.LINE_AA)
     cv2.putText(frame, "POINT: DRAW SQUARE   PINCH: GRAB   OPEN: REPULSOR   FIST: CHARGE", (w // 2 - 300, h - 24), cv2.FONT_HERSHEY_SIMPLEX, .39, CYAN, 1, cv2.LINE_AA)
 
 
 def main():
-    ensure_model()
-    options = vision.HandLandmarkerOptions(
-        base_options=python.BaseOptions(model_asset_path=MODEL_PATH),
+    ensure_hand_model()
+    ensure_face_model()
+
+    hand_options = vision.HandLandmarkerOptions(
+        base_options=python.BaseOptions(model_asset_path=HAND_MODEL_PATH),
         running_mode=vision.RunningMode.VIDEO,
         num_hands=2,
         min_hand_detection_confidence=.62,
         min_hand_presence_confidence=.62,
         min_tracking_confidence=.62,
     )
-    cap = cv2.VideoCapture(0)
+    face_options = vision.FaceLandmarkerOptions(
+        base_options=python.BaseOptions(model_asset_path=FACE_MODEL_PATH),
+        running_mode=vision.RunningMode.VIDEO,
+        num_faces=1,
+        min_face_detection_confidence=.35,
+        min_face_presence_confidence=.35,
+        min_tracking_confidence=.35,
+        output_face_blendshapes=True,
+    )
+
+    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    if not cap.isOpened():
+        cap.release()
+        cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         raise RuntimeError("Could not open webcam. Check camera permissions/device.")
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    cap.set(cv2.CAP_PROP_FPS, 30)
 
     holo = Hologram(1280, 720)
     prev = time.perf_counter()
     timestamp = 0
-    previous_center = None
+    face_phase = 0.0
     drawing_points = deque(maxlen=180)
     square_rect = None
     square_hold = 0
+    expression_history = deque(maxlen=7)
 
     try:
-        with vision.HandLandmarker.create_from_options(options) as landmarker:
+        with vision.HandLandmarker.create_from_options(hand_options) as hand_landmarker, vision.FaceLandmarker.create_from_options(face_options) as face_landmarker:
             while True:
                 ok, frame = cap.read()
                 if not ok:
@@ -297,11 +320,26 @@ def main():
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
                 timestamp += 33
-                result = landmarker.detect_for_video(image, timestamp)
+
+                hand_result = hand_landmarker.detect_for_video(image, timestamp)
+                face_result = face_landmarker.detect_for_video(image, timestamp)
+
+                # Face analysis runs in the same frame loop, so main.py alone launches everything.
+                face_detected = bool(face_result.face_landmarks)
+                face_expression = "SEARCHING"
+                face_raw_expression = None
+                face_phase = (face_phase + 2.2) % 360
+                if face_detected:
+                    bs = blendshape_map(face_result.face_blendshapes[0]) if face_result.face_blendshapes else {}
+                    face_raw_expression = draw_face_hud(frame, face_result.face_landmarks[0], bs, face_phase)
+                    expression_history.append(face_raw_expression)
+                    face_expression = max(set(expression_history), key=expression_history.count)
+                else:
+                    expression_history.clear()
+
                 hand_data = []
                 gestures = []
-
-                for l in result.hand_landmarks:
+                for l in hand_result.hand_landmarks:
                     gesture = classify(l)
                     x, y = xy(l, frame.shape)
                     gestures.append(gesture)
@@ -330,15 +368,14 @@ def main():
                         if random.random() < .28:
                             holo.spawn(x, y, 5, .8)
 
-                if not result.hand_landmarks:
+                if not hand_result.hand_landmarks:
                     holo.lock *= .94
                 else:
                     holo.lock = min(1, holo.lock)
 
-                # Two hands = floating Arc Reactor between the hands.
-                if len(result.hand_landmarks) >= 2:
-                    a = xy(result.hand_landmarks[0], frame.shape)
-                    b = xy(result.hand_landmarks[1], frame.shape)
+                if len(hand_result.hand_landmarks) >= 2:
+                    a = xy(hand_result.hand_landmarks[0], frame.shape)
+                    b = xy(hand_result.hand_landmarks[1], frame.shape)
                     cx, cy = (a[0] + b[0]) // 2, (a[1] + b[1]) // 2
                     d = math.hypot(a[0] - b[0], a[1] - b[1])
                     radius = max(45, min(125, d * .25))
@@ -362,7 +399,6 @@ def main():
                 elif not gestures or gestures[0] != "POINT":
                     drawing_points.clear()
 
-                # Fingertip trail and target lock box.
                 for i in range(1, len(holo.trails)):
                     cv2.line(frame, holo.trails[i - 1], holo.trails[i], BLUE, max(1, i // 6), cv2.LINE_AA)
                 if holo.trails:
@@ -373,7 +409,6 @@ def main():
                 holo.update(hand_data)
                 holo.draw(frame)
 
-                # Screen-center scanning reticle gives the camera a Stark-lab feel.
                 cx, cy = w // 2, h // 2
                 scan = frame.copy()
                 r = 80 + int(8 * math.sin(time.perf_counter() * 3))
@@ -388,8 +423,8 @@ def main():
                 fps = 1 / max(now - prev, 1e-6)
                 prev = now
                 primary = gestures[0] if gestures else "NO HAND"
-                hud(frame, primary, len(result.hand_landmarks), fps, holo.energy, holo.lock > .65)
-                cv2.imshow("J.A.R.V.I.S. // Hand Interface", frame)
+                hud(frame, primary, len(hand_result.hand_landmarks), fps, holo.energy, holo.lock > .65, face_detected, face_expression)
+                cv2.imshow("J.A.R.V.I.S. // Hand + Face Interface", frame)
 
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord('q'), 27):
