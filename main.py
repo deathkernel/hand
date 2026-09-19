@@ -162,6 +162,24 @@ def hud(frame, gesture, hands, fps, energy, locked, face_detected, face_expressi
     cv2.putText(frame, "POINT: DRAW SQUARE   PINCH: GRAB   OPEN: REPULSOR   F11: FULLSCREEN", (max(20, w // 2 - 390), h - 24), cv2.FONT_HERSHEY_SIMPLEX, .39, CYAN, 1, cv2.LINE_AA)
 
 
+def expression_name(value):
+    """Normalize facial-HUD return values to a hashable expression string."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in ("expression", "name", "label"):
+            candidate = value.get(key)
+            if isinstance(candidate, str):
+                return candidate
+        return "NEUTRAL"
+    if isinstance(value, (tuple, list)):
+        for item in value:
+            name = expression_name(item)
+            if name != "NEUTRAL":
+                return name
+    return "NEUTRAL"
+
+
 def main():
     ensure_hand_model()
     ensure_face_model()
@@ -216,7 +234,8 @@ def main():
                 if face_detected:
                     bs = blendshape_map(face_result.face_blendshapes[0]) if face_result.face_blendshapes else {}
                     raw = draw_face_hud(frame, face_result.face_landmarks[0], bs, visual.rotation)
-                    expression_history.append(raw)
+                    raw_name = expression_name(raw)
+                    expression_history.append(raw_name)
                     face_expression = max(set(expression_history), key=expression_history.count)
                 else:
                     expression_history.clear()
