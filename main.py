@@ -1,11 +1,8 @@
 import math
 import os
-import random
 import time
 import urllib.request
 from collections import deque
-from dataclasses import dataclass
-from typing import List
 
 import cv2
 import mediapipe as mp
@@ -28,83 +25,19 @@ WHITE = (235, 245, 255)
 DARK = (8, 10, 18)
 
 
-@dataclass
-class Particle:
-    x: float
-    y: float
-    z: float
-    vx: float
-    vy: float
-    vz: float
-    life: float
-    size: float
+class VisualState:
+    """State for the clean HUD effects; intentionally contains no particles."""
 
-
-class Hologram:
-    def __init__(self, w, h):
-        self.w, self.h = w, h
-        self.particles: List[Particle] = []
-        self.trails = deque(maxlen=22)
+    def __init__(self):
         self.energy = 72.0
         self.rotation = 0.0
         self.lock = 0.0
         self.last_two_distance = None
 
-    def spawn(self, x, y, count=10, burst=1.0):
-        for _ in range(count):
-            a = random.random() * math.tau
-            speed = random.uniform(1.0, 4.0) * burst
-            self.particles.append(Particle(
-                x + random.uniform(-7, 7), y + random.uniform(-7, 7), random.uniform(-1, 1),
-                math.cos(a) * speed, math.sin(a) * speed, random.uniform(-1.5, 1.5),
-                random.uniform(30, 100), random.uniform(1.0, 3.0)))
-        if len(self.particles) > 1800:
-            del self.particles[:-1800]
-
-    def blast(self, x, y, amount=180):
-        self.spawn(x, y, amount, 3.2)
-
-    def update(self, hands):
-        self.rotation += 0.018
-        self.energy = min(100, self.energy + 0.08)
-        for p in self.particles:
-            p.vx += math.sin(p.y * 0.012 + p.z * 2) * 0.012
-            p.vy += math.cos(p.x * 0.010 - p.z) * 0.012
-            p.vz += math.sin(p.x * 0.008 + p.y * 0.006) * 0.008
-            for x, y, gesture, strength in hands:
-                dx, dy = x - p.x, y - p.y
-                d2 = dx * dx + dy * dy + 500
-                if gesture == "PINCH":
-                    f = min(1.8, 1200 / d2) * (1 + strength)
-                    p.vx += dx * f * 0.015
-                    p.vy += dy * f * 0.015
-                elif gesture == "OPEN":
-                    f = min(1.4, 900 / d2) * (1 + strength)
-                    p.vx -= dx * f * 0.012
-                    p.vy -= dy * f * 0.012
-                elif gesture == "FIST":
-                    p.vx += (self.w / 2 - p.x) * 0.0008
-                    p.vy += (self.h / 2 - p.y) * 0.0008
-            p.x += p.vx
-            p.y += p.vy
-            p.z += p.vz
-            p.vx *= 0.988
-            p.vy *= 0.988
-            p.vz *= 0.985
-            p.life -= 1
-            p.size *= 0.998
-        self.particles = [p for p in self.particles if p.life > 0 and -100 < p.x < self.w + 100 and -100 < p.y < self.h + 100]
-
-    def draw(self, frame):
-        glow = frame.copy()
-        for p in self.particles:
-            scale = 1.0 / max(0.55, 1.0 + p.z * 0.15)
-            x, y = int(p.x), int(p.y)
-            r = max(1, int(p.size * scale))
-            if 0 <= x < self.w and 0 <= y < self.h:
-                cv2.circle(frame, (x, y), r, CYAN, -1)
-                cv2.circle(glow, (x, y), r * 5, BLUE, -1)
-        cv2.addWeighted(glow, 0.08, frame, 0.92, 0, frame)
+    def update(self, has_hands):
+        self.rotation = (self.rotation + 0.018) % math.tau
+        self.energy = min(100.0, self.energy + 0.08)
+        self.lock = min(1.0, self.lock) if has_hands else self.lock * 0.94
 
 
 def ensure_hand_model():
@@ -254,13 +187,12 @@ def main():
     cv2.setWindowProperty(WINDOW, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
     fullscreen = True
 
-    holo = Hologram(1280, 720)
+    visual = VisualState()
     drawing_points = deque(maxlen=180)
     square_rect = None
     square_hold = 0
     expression_history = deque(maxlen=7)
     timestamp = 0
-    phase = 0.0
     prev = time.perf_counter()
 
     try:
@@ -271,32 +203,29 @@ def main():
                     break
                 frame = cv2.flip(frame, 1)
                 h, w = frame.shape[:2]
-                if (w, h) != (holo.w, holo.h):
-                    holo = Hologram(w, h)
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
                 timestamp += 33
 
                 hand_result = hand_landmarker.detect_for_video(image, timestamp)
                 face_result = face_landmarker.detect_for_video(image, timestamp)
-                phase = (phase + 2.2) % 360
+                visual.rotation = (visual.rotation + 2.2) % 360
 
                 face_detected = bool(face_result.face_landmarks)
                 face_expression = "SEARCHING"
                 if face_detected:
                     bs = blendshape_map(face_result.face_blendshapes[0]) if face_result.face_blendshapes else {}
-                    raw = draw_face_hud(frame, face_result.face_landmarks[0], bs, phase)
+                    raw = draw_face_hud(frame, face_result.face_landmarks[0], bs, visual.rotation)
                     expression_history.append(raw)
                     face_expression = max(set(expression_history), key=expression_history.count)
                 else:
                     expression_history.clear()
 
-                hand_data, gestures = [], []
+                gestures = []
                 for l in hand_result.hand_landmarks:
                     gesture = classify(l)
                     x, y = xy(l, frame.shape)
                     gestures.append(gesture)
-                    hand_data.append((x, y, gesture, 0.0))
                     draw_hand(frame, l, gesture)
                     if gesture == "POINT":
                         drawing_points.append((x, y))
@@ -304,33 +233,24 @@ def main():
                             m = square_metrics(drawing_points)
                             if m and m["valid"]:
                                 square_rect, square_hold = clean_square(m), 18
-                        holo.lock = min(1, holo.lock + .08)
-                        holo.spawn(x, y, 3, .5)
-                        holo.trails.append((x, y))
+                        visual.lock = min(1, visual.lock + .08)
                     elif gesture == "PINCH":
-                        holo.energy = max(0, holo.energy - .04)
-                        holo.spawn(x, y, 7, 1.1)
-                        holo.trails.append((x, y))
+                        visual.energy = max(0, visual.energy - .04)
                     elif gesture == "OPEN":
-                        holo.energy = min(100, holo.energy + .16)
-                        holo.spawn(x, y, 4, .7)
+                        visual.energy = min(100, visual.energy + .16)
                     elif gesture == "FIST":
-                        holo.energy = min(100, holo.energy + .3)
-                        if random.random() < .28:
-                            holo.spawn(x, y, 5, .8)
+                        visual.energy = min(100, visual.energy + .3)
 
-                holo.lock = min(1, holo.lock) if hand_result.hand_landmarks else holo.lock * .94
+                visual.lock = min(1, visual.lock) if hand_result.hand_landmarks else visual.lock * .94
                 if len(hand_result.hand_landmarks) >= 2:
                     a, b = xy(hand_result.hand_landmarks[0], frame.shape), xy(hand_result.hand_landmarks[1], frame.shape)
                     cx, cy = (a[0] + b[0]) // 2, (a[1] + b[1]) // 2
                     d = math.hypot(a[0] - b[0], a[1] - b[1])
-                    if holo.last_two_distance is not None and d - holo.last_two_distance > 70:
-                        holo.blast(cx, cy, 220)
-                    holo.last_two_distance = d
-                    arc_reactor(frame, (cx, cy), max(45, min(125, d * .25)), holo.rotation, holo.energy)
+                    visual.last_two_distance = d
+                    arc_reactor(frame, (cx, cy), max(45, min(125, d * .25)), visual.rotation, visual.energy)
                     cv2.line(frame, a, b, BLUE, 1, cv2.LINE_AA)
                 else:
-                    holo.last_two_distance = None
+                    visual.last_two_distance = None
 
                 if square_hold > 0 and square_rect:
                     x1, y1, x2, y2 = square_rect
@@ -341,28 +261,28 @@ def main():
                 elif not gestures or gestures[0] != "POINT":
                     drawing_points.clear()
 
-                for i in range(1, len(holo.trails)):
-                    cv2.line(frame, holo.trails[i - 1], holo.trails[i], BLUE, max(1, i // 6), cv2.LINE_AA)
-                holo.update(hand_data)
-                holo.draw(frame)
+                visual.update(bool(hand_result.hand_landmarks))
 
                 now = time.perf_counter()
                 fps = 1 / max(now - prev, 1e-6)
                 prev = now
                 primary = gestures[0] if gestures else "NO HAND"
-                hud(frame, primary, len(hand_result.hand_landmarks), fps, holo.energy, holo.lock > .65, face_detected, face_expression)
+                hud(frame, primary, len(hand_result.hand_landmarks), fps, visual.energy, visual.lock > .65, face_detected, face_expression)
                 cv2.imshow(WINDOW, frame)
 
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord('q'), 27):
                     break
-                if key == 0x7A:  # F11 on many Windows OpenCV builds
+                if key == 0x7A:
                     fullscreen = not fullscreen
                     cv2.setWindowProperty(WINDOW, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN if fullscreen else cv2.WINDOW_NORMAL)
                 if key in (ord('r'), ord('R')):
-                    holo = Hologram(w, h)
+                    visual = VisualState()
+                    drawing_points.clear()
+                    square_rect = None
+                    square_hold = 0
                 if key in (ord('b'), ord('B')):
-                    holo.blast(w // 2, h // 2, 250)
+                    visual.energy = min(100, visual.energy + 8)
     finally:
         cap.release()
         cv2.destroyAllWindows()
