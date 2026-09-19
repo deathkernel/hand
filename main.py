@@ -163,6 +163,43 @@ def xy(l, shape):
     return int(l[8].x * w), int(l[8].y * h)
 
 
+
+def square_metrics(points):
+    if len(points) < 20:
+        return None
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+    width = max_x - min_x
+    height = max_y - min_y
+    if width < 35 or height < 35:
+        return None
+    closure = math.hypot(points[-1][0] - points[0][0], points[-1][1] - points[0][1])
+    scale = max(width, height)
+    aspect_error = abs(width - height) / scale
+    path = sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(points, points[1:]))
+    perimeter = 2.0 * (width + height)
+    path_ratio = path / max(perimeter, 1.0)
+    score = 1.0
+    score -= min(1.0, aspect_error / 0.35) * 0.35
+    score -= min(1.0, (closure / scale) / 0.25) * 0.40
+    score -= min(1.0, abs(path_ratio - 1.0) / 0.8) * 0.25
+    return {
+        "min_x": min_x, "max_x": max_x, "min_y": min_y, "max_y": max_y,
+        "score": score,
+        "valid": closure / scale < 0.25 and aspect_error < 0.35 and 0.7 < path_ratio < 2.2 and score >= 0.58,
+    }
+
+
+def clean_square(metrics):
+    side = int(max(metrics["max_x"] - metrics["min_x"], metrics["max_y"] - metrics["min_y"]))
+    cx = int((metrics["min_x"] + metrics["max_x"]) / 2)
+    cy = int((metrics["min_y"] + metrics["max_y"]) / 2)
+    half = side // 2
+    return cx - half, cy - half, cx + half, cy + half
+
+
 def draw_hand(frame, l, gesture):
     h, w = frame.shape[:2]
     pts = [(int(p.x * w), int(p.y * h)) for p in l]
@@ -219,7 +256,7 @@ def hud(frame, gesture, hands, fps, energy, locked):
     cv2.putText(frame, f"TARGET    {'LOCKED' if locked else 'SEARCHING'}", (34, 138), cv2.FONT_HERSHEY_SIMPLEX, .42, ORANGE if locked else CYAN, 1, cv2.LINE_AA)
 
     # Minimal bottom command strip.
-    cv2.putText(frame, "POINT: TARGET   PINCH: GRAB   OPEN: REPULSOR   FIST: CHARGE", (w // 2 - 300, h - 24), cv2.FONT_HERSHEY_SIMPLEX, .39, CYAN, 1, cv2.LINE_AA)
+    cv2.putText(frame, "POINT: DRAW SQUARE   PINCH: GRAB   OPEN: REPULSOR   FIST: CHARGE", (w // 2 - 300, h - 24), cv2.FONT_HERSHEY_SIMPLEX, .39, CYAN, 1, cv2.LINE_AA)
 
 
 def main():
@@ -242,6 +279,9 @@ def main():
     prev = time.perf_counter()
     timestamp = 0
     previous_center = None
+    drawing_points = deque(maxlen=180)
+    square_rect = None
+    square_hold = 0
 
     try:
         with vision.HandLandmarker.create_from_options(options) as landmarker:
@@ -269,6 +309,12 @@ def main():
                     draw_hand(frame, l, gesture)
 
                     if gesture == "POINT":
+                        drawing_points.append((x, y))
+                        if len(drawing_points) >= 20:
+                            metrics = square_metrics(drawing_points)
+                            if metrics and metrics["valid"]:
+                                square_rect = clean_square(metrics)
+                                square_hold = 18
                         holo.lock = min(1.0, holo.lock + .08)
                         holo.spawn(x, y, 3, .5)
                         holo.trails.append((x, y))
@@ -304,6 +350,17 @@ def main():
                     cv2.line(frame, a, b, BLUE, 1, cv2.LINE_AA)
                 else:
                     holo.last_two_distance = None
+
+                if square_hold > 0 and square_rect:
+                    x1, y1, x2, y2 = square_rect
+                    glow = frame.copy()
+                    cv2.rectangle(glow, (x1, y1), (x2, y2), CYAN, 2, cv2.LINE_AA)
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), WHITE, 1, cv2.LINE_AA)
+                    cv2.putText(frame, "SQUARE DETECTED", (x1, max(24, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, .48, CYAN, 1, cv2.LINE_AA)
+                    cv2.addWeighted(glow, .22, frame, .78, 0, frame)
+                    square_hold -= 1
+                elif not gestures or gestures[0] != "POINT":
+                    drawing_points.clear()
 
                 # Fingertip trail and target lock box.
                 for i in range(1, len(holo.trails)):
