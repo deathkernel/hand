@@ -72,6 +72,66 @@ def point(landmarks, idx, w, h):
     return int(p.x * w), int(p.y * h)
 
 
+def distance(a, b):
+    return math.hypot(a[0] - b[0], a[1] - b[1])
+
+
+def clamp_score(value):
+    return max(0.0, min(100.0, value))
+
+
+def facial_geometry(landmarks):
+    """Return geometric proportions/symmetry metrics, not an attractiveness judgment."""
+    def xy(i):
+        p = landmarks[i]
+        return p.x, p.y
+
+    left_eye = xy(33)
+    right_eye = xy(263)
+    nose_tip = xy(1)
+    chin = xy(152)
+    forehead = xy(10)
+    left_cheek = xy(234)
+    right_cheek = xy(454)
+    left_mouth = xy(61)
+    right_mouth = xy(291)
+
+    face_width = max(distance(left_cheek, right_cheek), 1e-6)
+    face_height = max(distance(forehead, chin), 1e-6)
+    eye_span = max(distance(left_eye, right_eye), 1e-6)
+    mouth_width = distance(left_mouth, right_mouth)
+
+    width_height_ratio = face_width / face_height
+    eye_mouth_ratio = eye_span / max(mouth_width, 1e-6)
+
+    # Midline symmetry: compare mirrored left/right landmarks around the face center.
+    center_x = (left_cheek[0] + right_cheek[0]) / 2
+    pairs = [(33, 263), (133, 362), (61, 291), (234, 454), (93, 323), (58, 288)]
+    errors = []
+    for li, ri in pairs:
+        lp = xy(li)
+        rp = xy(ri)
+        mirror_error = math.hypot((center_x - lp[0]) - (rp[0] - center_x), lp[1] - rp[1])
+        scale = max(face_width, 1e-6)
+        errors.append(mirror_error / scale)
+    symmetry = clamp_score(100.0 * (1.0 - min(1.0, sum(errors) / len(errors) * 2.8)))
+
+    # Proportion consistency uses stable ratios rather than a beauty model.
+    ratio_target = 0.72
+    ratio_score = clamp_score(100.0 - abs(width_height_ratio - ratio_target) * 140.0)
+    eye_mouth_target = 2.45
+    eye_mouth_score = clamp_score(100.0 - abs(eye_mouth_ratio - eye_mouth_target) * 24.0)
+    proportion = clamp_score((ratio_score * 0.55) + (eye_mouth_score * 0.45))
+    geometry = clamp_score(symmetry * 0.55 + proportion * 0.45)
+
+    return {
+        "symmetry": symmetry,
+        "proportion": proportion,
+        "geometry": geometry,
+        "width_height": width_height_ratio,
+    }
+
+
 def line_chain(layer, landmarks, indices, w, h, color, thickness=1):
     pts = [point(landmarks, i, w, h) for i in indices if i < len(landmarks)]
     if len(pts) > 1:
@@ -93,9 +153,8 @@ def draw_face_hud(frame, landmarks, bs, phase):
     y2 = min(h - 1, int(max(ys) * h) + 18)
     cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
     face_w = max(1, x2 - x1)
-    face_h = max(1, y2 - y1)
-    radius = max(70, min(175, int(face_w * 0.62)))
-    name, score = expression(bs)
+    name, _ = expression(bs)
+    metrics = facial_geometry(landmarks)
 
     glow = frame.copy()
     arm = 30
@@ -105,6 +164,7 @@ def draw_face_hud(frame, landmarks, bs, phase):
                  ((x2, y2), (x2 - arm, y2)), ((x2, y2), (x2, y2 - arm))]:
         cv2.line(glow, a, b, CYAN, 2, cv2.LINE_AA)
 
+    radius = max(70, min(175, int(face_w * 0.62)))
     arc(glow, (cx, cy), radius, phase, phase + 92, CYAN, 2)
     arc(glow, (cx, cy), radius + 12, -phase * 1.7, -phase * 1.7 + 48, BLUE, 1)
     arc(glow, (cx, cy), radius + 27, phase * 0.55, phase * 0.55 + 22, ORANGE, 1)
@@ -131,7 +191,7 @@ def draw_face_hud(frame, landmarks, bs, phase):
     cv2.putText(glow, "TARGET ACQUIRED", (x1, max(18, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, .38, CYAN, 1, cv2.LINE_AA)
     cv2.addWeighted(glow, 0.92, frame, 0.08, 0, frame)
 
-    panel_w, panel_h = 250, 125
+    panel_w, panel_h = 270, 185
     px = x2 + 28
     if px + panel_w >= w:
         px = max(18, x1 - panel_w - 28)
@@ -143,15 +203,18 @@ def draw_face_hud(frame, landmarks, bs, phase):
 
     lines = [
         ("J.A.R.V.I.S.", .58, WHITE, 2),
-        ("FACIAL INTERFACE // ONLINE", .32, CYAN, 1),
-        (f"EXPRESSION   {name}", .38, ORANGE, 1),
-        (f"CONFIDENCE   {score * 100:04.1f}%", .36, WHITE, 1),
+        ("FACIAL ANALYSIS // ONLINE", .31, CYAN, 1),
+        (f"EXPRESSION   {name}", .36, ORANGE, 1),
+        ("GEOMETRY METRICS", .31, CYAN, 1),
+        (f"SYMMETRY     {metrics['symmetry']:05.1f}%", .35, WHITE, 1),
+        (f"PROPORTION   {metrics['proportion']:05.1f}%", .35, WHITE, 1),
+        (f"GEOMETRY     {metrics['geometry']:05.1f}%", .39, ORANGE, 1),
     ]
     y = py + 27
     for text, size, color, thickness in lines:
         cv2.putText(frame, text, (px + 14, y), cv2.FONT_HERSHEY_SIMPLEX, size, color, thickness, cv2.LINE_AA)
-        y += 25
-    return name
+        y += 24
+    return name, metrics
 
 
 def main():
@@ -187,7 +250,7 @@ def main():
                 name = "SEARCHING"
                 if detected:
                     bs = blendshape_map(result.face_blendshapes[0]) if result.face_blendshapes else {}
-                    raw_name = draw_face_hud(frame, result.face_landmarks[0], bs, phase)
+                    raw_name, _ = draw_face_hud(frame, result.face_landmarks[0], bs, phase)
                     expression_history.append(raw_name)
                     name = max(set(expression_history), key=expression_history.count)
                 else:
