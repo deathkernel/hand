@@ -67,6 +67,14 @@ def expression(bs):
     return "NEUTRAL", 1.0 - min(1.0, max(smile, frown, jaw, wide))
 
 
+def face_telemetry(bs):
+    smile = (bs.get("mouthSmileLeft", 0) + bs.get("mouthSmileRight", 0)) / 2
+    blink_l = bs.get("eyeBlinkLeft", 0)
+    blink_r = bs.get("eyeBlinkRight", 0)
+    jaw = bs.get("jawOpen", 0)
+    return smile, blink_l, blink_r, jaw
+
+
 def point(landmarks, idx, w, h):
     p = landmarks[idx]
     return int(p.x * w), int(p.y * h)
@@ -75,7 +83,8 @@ def point(landmarks, idx, w, h):
 def line_chain(layer, landmarks, indices, w, h, color, thickness=1):
     pts = [point(landmarks, i, w, h) for i in indices if i < len(landmarks)]
     if len(pts) > 1:
-        cv2.polylines(layer, [__import__('numpy').array(pts, dtype='int32')], False, color, thickness, cv2.LINE_AA)
+        import numpy as np
+        cv2.polylines(layer, [np.array(pts, dtype="int32")], False, color, thickness, cv2.LINE_AA)
 
 
 def arc(layer, center, radius, start, end, color, thickness=1):
@@ -92,12 +101,12 @@ def draw_face_hud(frame, landmarks, bs, phase):
     y2 = min(h - 1, int(max(ys) * h) + 18)
     cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
     face_w = max(1, x2 - x1)
+    face_h = max(1, y2 - y1)
     radius = max(70, min(175, int(face_w * 0.62)))
     name, score = expression(bs)
+    smile, blink_l, blink_r, jaw = face_telemetry(bs)
 
     glow = frame.copy()
-
-    # Face lock brackets.
     arm = 30
     for a, b in [((x1, y1), (x1 + arm, y1)), ((x1, y1), (x1, y1 + arm)),
                  ((x2, y1), (x2 - arm, y1)), ((x2, y1), (x2, y1 + arm)),
@@ -105,22 +114,17 @@ def draw_face_hud(frame, landmarks, bs, phase):
                  ((x2, y2), (x2 - arm, y2)), ((x2, y2), (x2, y2 - arm))]:
         cv2.line(glow, a, b, CYAN, 2, cv2.LINE_AA)
 
-    # Concentric targeting rings.
     arc(glow, (cx, cy), radius, phase, phase + 92, CYAN, 2)
     arc(glow, (cx, cy), radius + 12, -phase * 1.7, -phase * 1.7 + 48, BLUE, 1)
     arc(glow, (cx, cy), radius + 27, phase * 0.55, phase * 0.55 + 22, ORANGE, 1)
     cv2.circle(glow, (cx, cy), 5, WHITE, -1)
-
-    # Horizontal targeting line and center crosshair.
     cv2.line(glow, (max(0, cx - radius - 35), cy), (min(w - 1, cx + radius + 35), cy), BLUE, 1, cv2.LINE_AA)
     cv2.line(glow, (cx, max(0, cy - 22)), (cx, min(h - 1, cy + 22)), BLUE, 1, cv2.LINE_AA)
 
-    # Face landmark mesh: deliberately sparse so it looks like a holographic scan.
     for i in range(0, len(landmarks), 5):
         px, py = point(landmarks, i, w, h)
         cv2.circle(glow, (px, py), 1, CYAN, -1, cv2.LINE_AA)
 
-    # Key facial contours.
     for chain in (
         (10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379, 378),
         (10, 109, 67, 103, 54, 21, 162, 127, 234, 93, 132, 58, 172, 136, 150, 149),
@@ -129,24 +133,19 @@ def draw_face_hud(frame, landmarks, bs, phase):
     ):
         line_chain(glow, landmarks, chain, w, h, BLUE, 1)
 
-    # Eye targeting markers.
     for idx in (33, 263):
         px, py = point(landmarks, idx, w, h)
         cv2.circle(glow, (px, py), 11, CYAN, 1, cv2.LINE_AA)
         cv2.line(glow, (px - 17, py), (px + 17, py), CYAN, 1, cv2.LINE_AA)
         cv2.line(glow, (px, py - 17), (px, py + 17), CYAN, 1, cv2.LINE_AA)
 
-    # Animated scan beam crossing the face.
     beam_y = y1 + int(((math.sin(phase * 0.045) + 1) * 0.5) * max(1, y2 - y1))
     cv2.line(glow, (x1, beam_y), (x2, beam_y), CYAN, 2, cv2.LINE_AA)
-
-    # Small corner telemetry.
     cv2.putText(glow, "TARGET ACQUIRED", (x1, max(18, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, .38, CYAN, 1, cv2.LINE_AA)
-    cv2.putText(glow, "BIOMETRIC SCAN", (x2 - 150, min(h - 10, y2 + 22)), cv2.FONT_HERSHEY_SIMPLEX, .34, BLUE, 1, cv2.LINE_AA)
+    cv2.putText(glow, "FACIAL ANALYSIS", (x2 - 145, min(h - 10, y2 + 22)), cv2.FONT_HERSHEY_SIMPLEX, .34, BLUE, 1, cv2.LINE_AA)
     cv2.addWeighted(glow, 0.92, frame, 0.08, 0, frame)
 
-    # Right-side tactical panel.
-    panel_w, panel_h = 285, 170
+    panel_w, panel_h = 310, 215
     px = x2 + 28
     if px + panel_w >= w:
         px = max(18, x1 - panel_w - 28)
@@ -155,13 +154,22 @@ def draw_face_hud(frame, landmarks, bs, phase):
     cv2.rectangle(panel, (px, py), (px + panel_w, py + panel_h), DARK, -1)
     cv2.addWeighted(panel, .84, frame, .16, 0, frame)
     cv2.rectangle(frame, (px, py), (px + panel_w, py + panel_h), BLUE, 1, cv2.LINE_AA)
-    cv2.putText(frame, "J.A.R.V.I.S.", (px + 14, py + 27), cv2.FONT_HERSHEY_SIMPLEX, .58, WHITE, 2, cv2.LINE_AA)
-    cv2.putText(frame, "FACIAL INTERFACE // ONLINE", (px + 14, py + 48), cv2.FONT_HERSHEY_SIMPLEX, .32, CYAN, 1, cv2.LINE_AA)
-    cv2.putText(frame, "TARGET     LOCKED", (px + 14, py + 72), cv2.FONT_HERSHEY_SIMPLEX, .38, CYAN, 1, cv2.LINE_AA)
-    cv2.putText(frame, f"EXPRESSION {name}", (px + 14, py + 94), cv2.FONT_HERSHEY_SIMPLEX, .38, ORANGE, 1, cv2.LINE_AA)
-    cv2.putText(frame, f"SIGNAL     {score * 100:04.1f}%", (px + 14, py + 114), cv2.FONT_HERSHEY_SIMPLEX, .36, WHITE, 1, cv2.LINE_AA)
-    cv2.putText(frame, f"EYE L/R    {bs.get('eyeBlinkLeft', 0):.2f} / {bs.get('eyeBlinkRight', 0):.2f}", (px + 14, py + 134), cv2.FONT_HERSHEY_SIMPLEX, .34, WHITE, 1, cv2.LINE_AA)
-    cv2.putText(frame, f"JAW        {bs.get('jawOpen', 0):.2f}", (px + 14, py + 153), cv2.FONT_HERSHEY_SIMPLEX, .34, WHITE, 1, cv2.LINE_AA)
+
+    lines = [
+        ("J.A.R.V.I.S.", .58, WHITE, 2),
+        ("FACIAL INTERFACE // ONLINE", .32, CYAN, 1),
+        ("TARGET       LOCKED", .38, CYAN, 1),
+        (f"EXPRESSION   {name}", .38, ORANGE, 1),
+        (f"CONFIDENCE   {score * 100:04.1f}%", .36, WHITE, 1),
+        (f"SMILE        {smile:.2f}", .34, WHITE, 1),
+        (f"BLINK L/R    {blink_l:.2f} / {blink_r:.2f}", .34, WHITE, 1),
+        (f"JAW OPEN     {jaw:.2f}", .34, WHITE, 1),
+        (f"FACE SIZE    {face_w} x {face_h}", .34, WHITE, 1),
+    ]
+    y = py + 27
+    for text, size, color, thickness in lines:
+        cv2.putText(frame, text, (px + 14, y), cv2.FONT_HERSHEY_SIMPLEX, size, color, thickness, cv2.LINE_AA)
+        y += 23 if size < .5 else 24
     return name
 
 
@@ -180,7 +188,7 @@ def main():
     cap = open_camera()
     phase = 0.0
     previous = time.perf_counter()
-    expression_history = deque(maxlen=5)
+    expression_history = deque(maxlen=7)
 
     try:
         with vision.FaceLandmarker.create_from_options(options) as landmarker:
@@ -201,19 +209,19 @@ def main():
                     raw_name = draw_face_hud(frame, result.face_landmarks[0], bs, phase)
                     expression_history.append(raw_name)
                     name = max(set(expression_history), key=expression_history.count)
+                else:
+                    expression_history.clear()
 
                 now = time.perf_counter()
                 fps = 1.0 / max(now - previous, 1e-6)
                 previous = now
 
-                # Minimal top HUD; the face itself remains the hero element.
                 cv2.putText(frame, "J.A.R.V.I.S. // BIOMETRIC INTERFACE", (22, 30), cv2.FONT_HERSHEY_SIMPLEX, .48, WHITE, 1, cv2.LINE_AA)
                 status = "TARGET ACQUIRED" if detected else "SCANNING FOR TARGET"
                 status_color = CYAN if detected else ORANGE
                 cv2.putText(frame, f"{status}   |   {name}   |   {fps:.0f} FPS", (22, 51), cv2.FONT_HERSHEY_SIMPLEX, .34, status_color, 1, cv2.LINE_AA)
-                cv2.putText(frame, "LOCAL PROCESSING // CAMERA FEED", (22, 70), cv2.FONT_HERSHEY_SIMPLEX, .30, BLUE, 1, cv2.LINE_AA)
+                cv2.putText(frame, "LOCAL PROCESSING // NO EXTERNAL API", (22, 70), cv2.FONT_HERSHEY_SIMPLEX, .30, BLUE, 1, cv2.LINE_AA)
 
-                # Tiny rotating HUD ticks around the screen edge.
                 hh, ww = frame.shape[:2]
                 for i in range(0, 360, 45):
                     a = math.radians(i + phase)
@@ -224,7 +232,7 @@ def main():
 
                 cv2.imshow("JARVIS // Facial Interface", frame)
                 key = cv2.waitKey(1) & 0xFF
-                if key in (ord('q'), 27):
+                if key in (ord("q"), 27):
                     break
     finally:
         cap.release()
