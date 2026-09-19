@@ -34,49 +34,56 @@ def ensure_model() -> None:
 
 
 def distance(a, b) -> float:
-    """2D distance between two MediaPipe landmarks."""
     return math.hypot(a.x - b.x, a.y - b.y)
 
 
 def joint_angle(a, b, c) -> float:
-    """Angle ABC in degrees."""
     ab_x, ab_y = a.x - b.x, a.y - b.y
     cb_x, cb_y = c.x - b.x, c.y - b.y
     ab_len = math.hypot(ab_x, ab_y)
     cb_len = math.hypot(cb_x, cb_y)
-
     if ab_len == 0 or cb_len == 0:
         return 0.0
-
     cosine = (ab_x * cb_x + ab_y * cb_y) / (ab_len * cb_len)
     cosine = max(-1.0, min(1.0, cosine))
     return math.degrees(math.acos(cosine))
 
 
 def finger_is_extended(landmarks, mcp: int, pip: int, dip: int, tip: int) -> bool:
-    """Detect an extended finger using joint angles and radial distance."""
+    """Detect a non-thumb finger from both joint straightness and length."""
     wrist = landmarks[0]
     pip_angle = joint_angle(landmarks[mcp], landmarks[pip], landmarks[dip])
     dip_angle = joint_angle(landmarks[pip], landmarks[dip], landmarks[tip])
 
-    # An extended finger is mostly straight and its tip is farther from
-    # the wrist than its PIP joint. This is rotation-independent in 2D.
-    straight = pip_angle > 155 and dip_angle > 150
-    farther = distance(landmarks[tip], wrist) > distance(landmarks[pip], wrist)
-    return straight and farther
+    # Both joints should be nearly straight. The tip should also be clearly
+    # farther from the wrist than the PIP joint to reject curled fingers.
+    straight = pip_angle >= 160 and dip_angle >= 155
+    extended = distance(landmarks[tip], wrist) > distance(landmarks[pip], wrist) * 1.08
+    return straight and extended
 
 
 def thumb_is_extended(landmarks) -> bool:
-    """Detect an extended thumb from its IP angle and wrist distance."""
+    """Detect a genuinely extended thumb and avoid counting a folded thumb."""
     wrist = landmarks[0]
-    angle = joint_angle(landmarks[2], landmarks[3], landmarks[4])
-    farther = distance(landmarks[4], wrist) > distance(landmarks[3], wrist) * 1.05
-    return angle > 145 and farther
+    thumb_mcp = landmarks[2]
+    thumb_ip = landmarks[3]
+    thumb_tip = landmarks[4]
+    index_mcp = landmarks[5]
+
+    # A straight thumb needs both thumb joints extended.
+    mcp_angle = joint_angle(landmarks[1], thumb_mcp, thumb_ip)
+    ip_angle = joint_angle(thumb_mcp, thumb_ip, thumb_tip)
+
+    # A folded thumb usually stays close to the palm. Require the tip to move
+    # substantially beyond the IP joint and away from the index MCP.
+    length_ok = distance(thumb_tip, wrist) > distance(thumb_ip, wrist) * 1.15
+    away_from_palm = distance(thumb_tip, index_mcp) > distance(thumb_ip, index_mcp) * 1.10
+
+    return mcp_angle >= 145 and ip_angle >= 150 and length_ok and away_from_palm
 
 
 def count_fingers(landmarks, handedness: str) -> int:
-    """Count extended fingers using landmark geometry, not image Y position."""
-    del handedness  # Counting is geometric and does not depend on hand side.
+    del handedness
 
     count = 1 if thumb_is_extended(landmarks) else 0
 
