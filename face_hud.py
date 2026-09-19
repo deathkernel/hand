@@ -2,6 +2,7 @@ import math
 import os
 import time
 import urllib.request
+from collections import deque
 
 import cv2
 import mediapipe as mp
@@ -16,7 +17,7 @@ CYAN = (255, 215, 40)
 BLUE = (255, 130, 20)
 ORANGE = (30, 170, 255)
 WHITE = (235, 245, 255)
-DARK = (8, 10, 18)
+DARK = (5, 8, 15)
 
 
 def ensure_model():
@@ -27,7 +28,19 @@ def ensure_model():
     urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
     if not os.path.isfile(MODEL_PATH) or os.path.getsize(MODEL_PATH) <= 100_000:
         raise RuntimeError("Face model download failed or is incomplete.")
-    print("Face model downloaded.")
+
+
+def open_camera():
+    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    if not cap.isOpened():
+        cap.release()
+        cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        raise RuntimeError("Could not open webcam. Check Windows Camera permissions and close other apps using the camera.")
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 960)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 540)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+    return cap
 
 
 def blendshape_map(categories):
@@ -41,7 +54,6 @@ def expression(bs):
     wide = (bs.get("eyeWideLeft", 0) + bs.get("eyeWideRight", 0)) / 2
     brow = (bs.get("browInnerUp", 0) + bs.get("browOuterUpLeft", 0) + bs.get("browOuterUpRight", 0)) / 3
     squint = (bs.get("eyeSquintLeft", 0) + bs.get("eyeSquintRight", 0)) / 2
-
     if smile > 0.42:
         return "HAPPY", smile
     if jaw > 0.48 and wide > 0.25:
@@ -55,15 +67,15 @@ def expression(bs):
     return "NEUTRAL", 1.0 - min(1.0, max(smile, frown, jaw, wide))
 
 
-def face_box(landmarks, shape):
-    h, w = shape[:2]
-    xs = [p.x for p in landmarks]
-    ys = [p.y for p in landmarks]
-    x1 = max(0, int(min(xs) * w) - 14)
-    y1 = max(0, int(min(ys) * h) - 14)
-    x2 = min(w - 1, int(max(xs) * w) + 14)
-    y2 = min(h - 1, int(max(ys) * h) + 14)
-    return x1, y1, x2, y2
+def point(landmarks, idx, w, h):
+    p = landmarks[idx]
+    return int(p.x * w), int(p.y * h)
+
+
+def line_chain(layer, landmarks, indices, w, h, color, thickness=1):
+    pts = [point(landmarks, i, w, h) for i in indices if i < len(landmarks)]
+    if len(pts) > 1:
+        cv2.polylines(layer, [__import__('numpy').array(pts, dtype='int32')], False, color, thickness, cv2.LINE_AA)
 
 
 def arc(layer, center, radius, start, end, color, thickness=1):
@@ -71,71 +83,90 @@ def arc(layer, center, radius, start, end, color, thickness=1):
 
 
 def draw_face_hud(frame, landmarks, bs, phase):
-    x1, y1, x2, y2 = face_box(landmarks, frame.shape)
+    h, w = frame.shape[:2]
+    xs = [p.x for p in landmarks]
+    ys = [p.y for p in landmarks]
+    x1 = max(0, int(min(xs) * w) - 18)
+    y1 = max(0, int(min(ys) * h) - 18)
+    x2 = min(w - 1, int(max(xs) * w) + 18)
+    y2 = min(h - 1, int(max(ys) * h) + 18)
     cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-    radius = max(55, min(150, int((x2 - x1) * 0.58)))
-    expression_name, confidence = expression(bs)
+    face_w = max(1, x2 - x1)
+    radius = max(70, min(175, int(face_w * 0.62)))
+    name, score = expression(bs)
 
     glow = frame.copy()
-    arm = 22
+
+    # Face lock brackets.
+    arm = 30
     for a, b in [((x1, y1), (x1 + arm, y1)), ((x1, y1), (x1, y1 + arm)),
                  ((x2, y1), (x2 - arm, y1)), ((x2, y1), (x2, y1 + arm)),
                  ((x1, y2), (x1 + arm, y2)), ((x1, y2), (x1, y2 - arm)),
                  ((x2, y2), (x2 - arm, y2)), ((x2, y2), (x2, y2 - arm))]:
         cv2.line(glow, a, b, CYAN, 2, cv2.LINE_AA)
 
-    arc(glow, (cx, cy), radius, phase % 360, (phase + 70) % 360, CYAN, 2)
-    arc(glow, (cx, cy), radius + 10, (-phase * 1.6) % 360, (-phase * 1.6 + 38) % 360, BLUE, 1)
-    cv2.circle(glow, (cx, cy), 4, WHITE, -1)
-    cv2.line(glow, (cx - radius - 18, cy), (cx + radius + 18, cy), BLUE, 1, cv2.LINE_AA)
+    # Concentric targeting rings.
+    arc(glow, (cx, cy), radius, phase, phase + 92, CYAN, 2)
+    arc(glow, (cx, cy), radius + 12, -phase * 1.7, -phase * 1.7 + 48, BLUE, 1)
+    arc(glow, (cx, cy), radius + 27, phase * 0.55, phase * 0.55 + 22, ORANGE, 1)
+    cv2.circle(glow, (cx, cy), 5, WHITE, -1)
 
-    # Robust eye scan markers: use the actual eye-region landmarks.
+    # Horizontal targeting line and center crosshair.
+    cv2.line(glow, (max(0, cx - radius - 35), cy), (min(w - 1, cx + radius + 35), cy), BLUE, 1, cv2.LINE_AA)
+    cv2.line(glow, (cx, max(0, cy - 22)), (cx, min(h - 1, cy + 22)), BLUE, 1, cv2.LINE_AA)
+
+    # Face landmark mesh: deliberately sparse so it looks like a holographic scan.
+    for i in range(0, len(landmarks), 5):
+        px, py = point(landmarks, i, w, h)
+        cv2.circle(glow, (px, py), 1, CYAN, -1, cv2.LINE_AA)
+
+    # Key facial contours.
+    for chain in (
+        (10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379, 378),
+        (10, 109, 67, 103, 54, 21, 162, 127, 234, 93, 132, 58, 172, 136, 150, 149),
+        (33, 7, 163, 144, 145, 153, 154, 155, 133),
+        (263, 249, 390, 373, 374, 380, 381, 382, 362),
+    ):
+        line_chain(glow, landmarks, chain, w, h, BLUE, 1)
+
+    # Eye targeting markers.
     for idx in (33, 263):
-        if idx < len(landmarks):
-            p = landmarks[idx]
-            px, py = int(p.x * frame.shape[1]), int(p.y * frame.shape[0])
-            cv2.circle(glow, (px, py), 8, CYAN, 1, cv2.LINE_AA)
-            cv2.line(glow, (px - 13, py), (px + 13, py), CYAN, 1, cv2.LINE_AA)
-            cv2.line(glow, (px, py - 13), (px, py + 13), CYAN, 1, cv2.LINE_AA)
+        px, py = point(landmarks, idx, w, h)
+        cv2.circle(glow, (px, py), 11, CYAN, 1, cv2.LINE_AA)
+        cv2.line(glow, (px - 17, py), (px + 17, py), CYAN, 1, cv2.LINE_AA)
+        cv2.line(glow, (px, py - 17), (px, py + 17), CYAN, 1, cv2.LINE_AA)
 
-    cv2.addWeighted(glow, 0.88, frame, 0.12, 0, frame)
+    # Animated scan beam crossing the face.
+    beam_y = y1 + int(((math.sin(phase * 0.045) + 1) * 0.5) * max(1, y2 - y1))
+    cv2.line(glow, (x1, beam_y), (x2, beam_y), CYAN, 2, cv2.LINE_AA)
 
-    panel_w = 267
-    px = min(frame.shape[1] - panel_w - 18, max(18, x2 + 28))
-    py = max(55, y1)
-    if px + panel_w > frame.shape[1]:
+    # Small corner telemetry.
+    cv2.putText(glow, "TARGET ACQUIRED", (x1, max(18, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, .38, CYAN, 1, cv2.LINE_AA)
+    cv2.putText(glow, "BIOMETRIC SCAN", (x2 - 150, min(h - 10, y2 + 22)), cv2.FONT_HERSHEY_SIMPLEX, .34, BLUE, 1, cv2.LINE_AA)
+    cv2.addWeighted(glow, 0.92, frame, 0.08, 0, frame)
+
+    # Right-side tactical panel.
+    panel_w, panel_h = 285, 170
+    px = x2 + 28
+    if px + panel_w >= w:
         px = max(18, x1 - panel_w - 28)
+    py = max(60, min(y1, h - panel_h - 18))
     panel = frame.copy()
-    cv2.rectangle(panel, (px, py), (px + panel_w, py + 132), DARK, -1)
-    cv2.addWeighted(panel, 0.82, frame, 0.18, 0, frame)
-    cv2.putText(frame, "FACE ANALYSIS", (px + 14, py + 25), cv2.FONT_HERSHEY_SIMPLEX, .52, WHITE, 1, cv2.LINE_AA)
-    cv2.putText(frame, "STATUS   TRACKING", (px + 14, py + 47), cv2.FONT_HERSHEY_SIMPLEX, .39, CYAN, 1, cv2.LINE_AA)
-    cv2.putText(frame, f"EXPRESSION  {expression_name}", (px + 14, py + 70), cv2.FONT_HERSHEY_SIMPLEX, .43, ORANGE, 1, cv2.LINE_AA)
-    cv2.putText(frame, f"SIGNAL      {confidence * 100:04.1f}%", (px + 14, py + 92), cv2.FONT_HERSHEY_SIMPLEX, .39, WHITE, 1, cv2.LINE_AA)
-    cv2.putText(frame, f"BLINK L/R   {bs.get('eyeBlinkLeft', 0):.2f} / {bs.get('eyeBlinkRight', 0):.2f}", (px + 14, py + 112), cv2.FONT_HERSHEY_SIMPLEX, .36, WHITE, 1, cv2.LINE_AA)
-    cv2.putText(frame, f"JAW OPEN    {bs.get('jawOpen', 0):.2f}", (px + 14, py + 128), cv2.FONT_HERSHEY_SIMPLEX, .36, WHITE, 1, cv2.LINE_AA)
-    return expression_name
-
-
-def open_camera():
-    # DirectShow is more reliable on Windows than the default backend for webcams.
-    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-    if not cap.isOpened():
-        cap.release()
-        cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        raise RuntimeError("Could not open webcam. Check Windows Camera permissions and close other apps using the camera.")
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 960)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 540)
-    cap.set(cv2.CAP_PROP_FPS, 30)
-    return cap
+    cv2.rectangle(panel, (px, py), (px + panel_w, py + panel_h), DARK, -1)
+    cv2.addWeighted(panel, .84, frame, .16, 0, frame)
+    cv2.rectangle(frame, (px, py), (px + panel_w, py + panel_h), BLUE, 1, cv2.LINE_AA)
+    cv2.putText(frame, "J.A.R.V.I.S.", (px + 14, py + 27), cv2.FONT_HERSHEY_SIMPLEX, .58, WHITE, 2, cv2.LINE_AA)
+    cv2.putText(frame, "FACIAL INTERFACE // ONLINE", (px + 14, py + 48), cv2.FONT_HERSHEY_SIMPLEX, .32, CYAN, 1, cv2.LINE_AA)
+    cv2.putText(frame, "TARGET     LOCKED", (px + 14, py + 72), cv2.FONT_HERSHEY_SIMPLEX, .38, CYAN, 1, cv2.LINE_AA)
+    cv2.putText(frame, f"EXPRESSION {name}", (px + 14, py + 94), cv2.FONT_HERSHEY_SIMPLEX, .38, ORANGE, 1, cv2.LINE_AA)
+    cv2.putText(frame, f"SIGNAL     {score * 100:04.1f}%", (px + 14, py + 114), cv2.FONT_HERSHEY_SIMPLEX, .36, WHITE, 1, cv2.LINE_AA)
+    cv2.putText(frame, f"EYE L/R    {bs.get('eyeBlinkLeft', 0):.2f} / {bs.get('eyeBlinkRight', 0):.2f}", (px + 14, py + 134), cv2.FONT_HERSHEY_SIMPLEX, .34, WHITE, 1, cv2.LINE_AA)
+    cv2.putText(frame, f"JAW        {bs.get('jawOpen', 0):.2f}", (px + 14, py + 153), cv2.FONT_HERSHEY_SIMPLEX, .34, WHITE, 1, cv2.LINE_AA)
+    return name
 
 
 def main():
     ensure_model()
-
-    # IMAGE mode is intentionally used here. It avoids timestamp/tracking issues
-    # and is very reliable for a single webcam face while still running in real time.
     options = vision.FaceLandmarkerOptions(
         base_options=python.BaseOptions(model_asset_path=MODEL_PATH),
         running_mode=vision.RunningMode.IMAGE,
@@ -149,49 +180,49 @@ def main():
     cap = open_camera()
     phase = 0.0
     previous = time.perf_counter()
-    frames = 0
-    detected = False
+    expression_history = deque(maxlen=5)
 
     try:
         with vision.FaceLandmarker.create_from_options(options) as landmarker:
             while True:
                 ok, frame = cap.read()
                 if not ok:
-                    print("Camera frame read failed.")
                     break
-
                 frame = cv2.flip(frame, 1)
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
                 result = landmarker.detect(image)
                 phase = (phase + 2.2) % 360
-                frames += 1
 
-                expression_name = "NO FACE"
-                if result.face_landmarks:
-                    detected = True
+                detected = bool(result.face_landmarks)
+                name = "SEARCHING"
+                if detected:
                     bs = blendshape_map(result.face_blendshapes[0]) if result.face_blendshapes else {}
-                    expression_name = draw_face_hud(frame, result.face_landmarks[0], bs, phase)
-                else:
-                    detected = False
+                    raw_name = draw_face_hud(frame, result.face_landmarks[0], bs, phase)
+                    expression_history.append(raw_name)
+                    name = max(set(expression_history), key=expression_history.count)
 
                 now = time.perf_counter()
                 fps = 1.0 / max(now - previous, 1e-6)
                 previous = now
 
-                overlay = frame.copy()
-                cv2.rectangle(overlay, (18, 18), (435, 112), DARK, -1)
-                cv2.addWeighted(overlay, .78, frame, .22, 0, frame)
-                status = "TRACKING" if detected else "SEARCHING..."
+                # Minimal top HUD; the face itself remains the hero element.
+                cv2.putText(frame, "J.A.R.V.I.S. // BIOMETRIC INTERFACE", (22, 30), cv2.FONT_HERSHEY_SIMPLEX, .48, WHITE, 1, cv2.LINE_AA)
+                status = "TARGET ACQUIRED" if detected else "SCANNING FOR TARGET"
                 status_color = CYAN if detected else ORANGE
-                cv2.putText(frame, "J.A.R.V.I.S. // FACE MODULE", (34, 48), cv2.FONT_HERSHEY_SIMPLEX, .62, WHITE, 2, cv2.LINE_AA)
-                cv2.putText(frame, f"FACE: {status}   EXP: {expression_name}   FPS: {fps:.0f}", (34, 73), cv2.FONT_HERSHEY_SIMPLEX, .36, status_color, 1, cv2.LINE_AA)
-                cv2.putText(frame, "LOCAL ANALYSIS // NO IMAGE UPLOAD", (34, 96), cv2.FONT_HERSHEY_SIMPLEX, .34, WHITE, 1, cv2.LINE_AA)
+                cv2.putText(frame, f"{status}   |   {name}   |   {fps:.0f} FPS", (22, 51), cv2.FONT_HERSHEY_SIMPLEX, .34, status_color, 1, cv2.LINE_AA)
+                cv2.putText(frame, "LOCAL PROCESSING // CAMERA FEED", (22, 70), cv2.FONT_HERSHEY_SIMPLEX, .30, BLUE, 1, cv2.LINE_AA)
 
-                if frames == 30 and not detected:
-                    print("No face detected after 30 frames. Move closer, face the camera, and improve lighting.")
+                # Tiny rotating HUD ticks around the screen edge.
+                hh, ww = frame.shape[:2]
+                for i in range(0, 360, 45):
+                    a = math.radians(i + phase)
+                    r1, r2 = 18, 25
+                    p1 = (int(ww / 2 + math.cos(a) * (ww / 2 - r1)), int(hh / 2 + math.sin(a) * (hh / 2 - r1)))
+                    p2 = (int(ww / 2 + math.cos(a) * (ww / 2 - r2)), int(hh / 2 + math.sin(a) * (hh / 2 - r2)))
+                    cv2.line(frame, p1, p2, BLUE, 1, cv2.LINE_AA)
 
-                cv2.imshow("JARVIS - Face HUD", frame)
+                cv2.imshow("JARVIS // Facial Interface", frame)
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord('q'), 27):
                     break
