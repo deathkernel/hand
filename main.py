@@ -1,3 +1,4 @@
+import math
 import os
 import time
 import urllib.request
@@ -32,19 +33,63 @@ def ensure_model() -> None:
     print("Model downloaded.")
 
 
-def count_fingers(landmarks, handedness: str) -> int:
-    fingers = 0
-    if handedness == "Right":
-        if landmarks[4].x < landmarks[3].x:
-            fingers += 1
-    else:
-        if landmarks[4].x > landmarks[3].x:
-            fingers += 1
+def distance(a, b) -> float:
+    """2D distance between two MediaPipe landmarks."""
+    return math.hypot(a.x - b.x, a.y - b.y)
 
-    for tip, pip in ((8, 6), (12, 10), (16, 14), (20, 18)):
-        if landmarks[tip].y < landmarks[pip].y:
-            fingers += 1
-    return fingers
+
+def joint_angle(a, b, c) -> float:
+    """Angle ABC in degrees."""
+    ab_x, ab_y = a.x - b.x, a.y - b.y
+    cb_x, cb_y = c.x - b.x, c.y - b.y
+    ab_len = math.hypot(ab_x, ab_y)
+    cb_len = math.hypot(cb_x, cb_y)
+
+    if ab_len == 0 or cb_len == 0:
+        return 0.0
+
+    cosine = (ab_x * cb_x + ab_y * cb_y) / (ab_len * cb_len)
+    cosine = max(-1.0, min(1.0, cosine))
+    return math.degrees(math.acos(cosine))
+
+
+def finger_is_extended(landmarks, mcp: int, pip: int, dip: int, tip: int) -> bool:
+    """Detect an extended finger using joint angles and radial distance."""
+    wrist = landmarks[0]
+    pip_angle = joint_angle(landmarks[mcp], landmarks[pip], landmarks[dip])
+    dip_angle = joint_angle(landmarks[pip], landmarks[dip], landmarks[tip])
+
+    # An extended finger is mostly straight and its tip is farther from
+    # the wrist than its PIP joint. This is rotation-independent in 2D.
+    straight = pip_angle > 155 and dip_angle > 150
+    farther = distance(landmarks[tip], wrist) > distance(landmarks[pip], wrist)
+    return straight and farther
+
+
+def thumb_is_extended(landmarks) -> bool:
+    """Detect an extended thumb from its IP angle and wrist distance."""
+    wrist = landmarks[0]
+    angle = joint_angle(landmarks[2], landmarks[3], landmarks[4])
+    farther = distance(landmarks[4], wrist) > distance(landmarks[3], wrist) * 1.05
+    return angle > 145 and farther
+
+
+def count_fingers(landmarks, handedness: str) -> int:
+    """Count extended fingers using landmark geometry, not image Y position."""
+    del handedness  # Counting is geometric and does not depend on hand side.
+
+    count = 1 if thumb_is_extended(landmarks) else 0
+
+    for mcp, pip, dip, tip in (
+        (5, 6, 7, 8),
+        (9, 10, 11, 12),
+        (13, 14, 15, 16),
+        (17, 18, 19, 20),
+    ):
+        if finger_is_extended(landmarks, mcp, pip, dip, tip):
+            count += 1
+
+    return count
 
 
 def gesture_name(count: int) -> str:
